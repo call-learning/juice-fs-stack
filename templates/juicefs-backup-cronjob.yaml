@@ -1,0 +1,42 @@
+{{- if .Values.juicefs.backup.enabled }}
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ .Release.Name }}-redis-backup
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "juicefs-stack.labels" . | nindent 4 }}
+spec:
+  schedule: "{{ .Values.juicefs.backup.schedule }}"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            {{- include "juicefs-stack.labels" . | nindent 12 }}
+        spec:
+          containers:
+            - name: backup
+              image: rclone/rclone:latest
+              command: ["/bin/sh", "-c"]
+              args:
+                - |
+                  mkdir -p /tmp/redis-backup && \
+                  cp /data/dump.rdb /tmp/redis-backup/dump-$(date +%F-%H-%M).rdb && \
+                  rclone copy /tmp/redis-backup s3backup:{{ .Values.juicefs.backup.s3.bucket }}/{{ .Values.juicefs.backup.s3.pathPrefix }}/$(date +%F)/ --config /config/{{ .Values.juicefs.backup.s3.rcloneConfigKey }}
+              volumeMounts:
+                - name: redis-data
+                  mountPath: /data
+                - name: rclone-config
+                  mountPath: /config
+              resources:
+                {{- toYaml .Values.resources | nindent 16 }}
+          restartPolicy: OnFailure
+          volumes:
+            - name: redis-data
+              persistentVolumeClaim:
+                claimName: {{ .Values.juicefs.backup.pvcName }}
+            - name: rclone-config
+              secret:
+                secretName: {{ .Values.juicefs.backup.s3.rcloneConfigSecret }}
+{{- end }}

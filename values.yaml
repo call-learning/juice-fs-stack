@@ -1,0 +1,63 @@
+juicefs-csi-driver:
+  storageClass:
+    enabled: true
+  controller:
+    enabled: true
+  node:
+    enabled: true
+  juicefs:
+    configFromSecret: juicefs-csi-config
+
+redis:
+  enabled: true
+  architecture: replication
+  auth:
+    enabled: true
+    password: "CHANGEME"
+  fullnameOverride: redis-jfs
+  replica:
+    replicaCount: 1
+  master:
+    persistence:
+      enabled: true
+      existingClaim: redis-data-redis-jfs-master-0
+    configmap: |-
+      appendonly yes
+      appendfsync everysec
+  sentinel:
+    enabled: true
+    masterSet: mymaster
+    quorum: 2
+    usePasswordFile: true
+
+juicefs:
+  csi:
+    enabled: true
+    storageClass:
+      create: true
+      name: juicefs-sc
+    runtimeProvision: true
+  meta:
+    port: 6379
+    db: 1
+  backup:
+    enabled: true
+    schedule: "0 * * * *"
+    s3:
+      bucket: juicefs-metadata
+      pathPrefix: backups
+      rcloneConfigSecret: rclone-secret
+      rcloneConfigKey: rclone.conf
+    pvcName: redis-data-redis-master-0
+  restore:
+    enabled: false
+    s3Key: latest/dump.rdb
+
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

@@ -1,0 +1,38 @@
+{{- if .Values.juicefs.restore.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-redis-restore
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "juicefs-stack.labels" . | nindent 4 }}
+spec:
+  template:
+    metadata:
+      labels:
+        {{- include "juicefs-stack.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: restore
+          image: rclone/rclone:latest
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              rclone copy s3backup:{{ .Values.juicefs.backup.s3.bucket }}/{{ .Values.juicefs.backup.s3.pathPrefix }}/{{ .Values.juicefs.restore.s3Key }} /data --config /config/{{ .Values.juicefs.backup.s3.rcloneConfigKey }} && \
+              touch /data/RESTORE_DONE
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+            - name: rclone-config
+              mountPath: /config
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      restartPolicy: Never
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: {{ .Values.juicefs.backup.pvcName }}
+        - name: rclone-config
+          secret:
+            secretName: {{ .Values.juicefs.backup.s3.rcloneConfigSecret }}
+{{- end }}
