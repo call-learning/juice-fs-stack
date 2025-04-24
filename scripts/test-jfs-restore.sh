@@ -5,72 +5,126 @@ set -euo pipefail
 NAMESPACE="juicefs-system"
 RELEASE="juicefs-test"
 PVC_NAME="juicefs-pvc"
+TEST_FILE="/mnt/juicefs/test-file.txt"
+CHART_DIR="$(dirname "$0")/.."
+NO_PREPARE=0
+
+while getopts "n" opt; do
+  case ${opt} in
+    n )
+      NO_PREPARE=1
+      ;;
+    \? )
+      echo "Usage: $0 [-n] [NAMESPACE] [RELEASE]"
+      exit 1
+      ;;
+  esac
+done
+
+shift $((OPTIND -1))
+SCRIPT_DIR=$(realpath "$(dirname "$0")")
+if [ "$NO_PREPARE" -eq 0 ]; then
+  echo "Preparing JuiceFS cluster in namespace $NAMESPACE with release $RELEASE..."
+  "$SCRIPT_DIR/prepare-jfs-cluster.sh" "$NAMESPACE" "$RELEASE"
+else
+  echo "Skipping JuiceFS cluster preparation."
+fi
 
 function info() {
   echo -e "\033[1;34m[INFO]\033[0m $1"
 }
 
-info "Simulating Redis failure by deleting the master pod..."
-kubectl delete pod redis-jfs-master-0 -n "$NAMESPACE"
+"$SCRIPT_DIR/create-pvc.sh" "$NAMESPACE" "$RELEASE"
 
-info "Running Redis restore job from S3..."
-kubectl apply -f charts/juicefs-core/templates/juicefs-restore-job.yaml
+info "Upgrading helm script"
+RCLONE_CONFIG="$(kubectl get secret juicefs-test-rclone-secret -n "$NAMESPACE" -o jsonpath="{.data.rclone\.conf}" | base64 --decode)"
 
-info "Waiting for Redis restore job to complete..."
-kubectl wait --for=condition=complete job/${RELEASE}-redis-restore -n "$NAMESPACE" --timeout=60s
+helm upgrade "$RELEASE" "$CHART_DIR" \
+  -n "$NAMESPACE" \
+  --set "juicefs.backup.s3.rcloneConfigContent=${RCLONE_CONFIG}" \
+  --wait
 
-info "Restarting Redis master pod to load restored data..."
-kubectl delete pod redis-jfs-master-0 -n "$NAMESPACE"
-
-info "Waiting for Redis master pod to be ready..."
-kubectl wait --for=condition=Ready pod -l app.kubernetes.io/component=master -n "$NAMESPACE" --timeout=60s
-
-info "Creating test pod to verify JuiceFS after Redis restore..."
+# Step 1: Create a file in JuiceFS
+info "Creating a test file in JuiceFS..."
+kubectl delete job juicefs-create-file -n "$NAMESPACE" || true
 kubectl apply -n "$NAMESPACE" -f - <<EOF
-apiVersion: v1
-kind: PersistentVolumeClaim
+apiVersion: batch/v1
+kind: Job
 metadata:
-  name: $PVC_NAME
+  name: juicefs-create-file
 spec:
-  accessModes:
-    - ReadWriteMany
-  storageClassName: juicefs-sc
-  resources:
-    requests:
-      storage: 1Gi
----
-apiVersion: v1
-kind: Pod
-metadata:
-  name: juicefs-post-restore-test
-spec:
-  containers:
-    - name: test
-      image: busybox
-      command: ["/bin/sh", "-c"]
-      args:
-        - |
-          echo "[TEST] Listing contents after restore:" && \
-          ls -l /mnt/juicefs && \
-          echo "[TEST] Attempting to read restored.txt:" && \
-          cat /mnt/juicefs/restored.txt || echo "[ERROR] restored.txt not found" && \
-          echo "[TEST] Writing post-restore check file..." && \
-          echo "restored write check" > /mnt/juicefs/test-after-restore.txt && \
-          cat /mnt/juicefs/test-after-restore.txt
-      volumeMounts:
-        - mountPath: "/mnt/juicefs"
-          name: juicefs-vol
-  volumes:
-    - name: juicefs-vol
-      persistentVolumeClaim:
-        claimName: $PVC_NAME
-  restartPolicy: Never
+  template:
+    spec:
+      containers:
+        - name: writer
+          image: busybox
+          command: ["/bin/sh", "-c"]
+          args: ["echo 'test data' > $TEST_FILE"]
+          volumeMounts:
+            - mountPath: "/mnt/juicefs"
+              name: juicefs-vol
+      volumes:
+        - name: juicefs-vol
+          persistentVolumeClaim:
+            claimName: $PVC_NAME
+      restartPolicy: Never
 EOF
 
-info "Waiting for test pod to complete..."
-kubectl wait --for=condition=Succeeded pod/juicefs-post-restore-test -n "$NAMESPACE" --timeout=60s
+kubectl wait --for=condition=complete job/juicefs-create-file -n "$NAMESPACE" --timeout=300s
+kubectl delete job juicefs-create-file -n "$NAMESPACE"
 
-info "Fetching logs from post-restore test pod..."
-kubectl logs juicefs-post-restore-test -n "$NAMESPACE"
+# Step 2: Trigger a backup
+info "Waiting for the backup CronJob to run..."
+info "Creating a backup job from the CronJob..."
+kubectl delete job backup-job -n "$NAMESPACE" || true
+kubectl create job --from=cronjob/juicefs-test-redis-backup backup-job -n "$NAMESPACE"
+kubectl wait --for=condition=complete job/backup-job -n "$NAMESPACE" --timeout=300s
 
-info "✅ JuiceFS end-to-end restore validation completed."
+# Step 3: Simulate Redis failure
+info "Simulating Redis failure by deleting the Redis service..."
+kubectl delete svc redis-jfs -n "$NAMESPACE"
+
+# Step 4: Restore Redis using the Helm chart
+info "Restoring Redis using the Helm chart..."
+helm upgrade --install "$RELEASE" ./juicefs-stack \
+  --namespace "$NAMESPACE" \
+  --set juicefs.restore.enabled=true \
+  --set juicefs.restore.s3Key="path/to/backup/dump.rdb"
+
+# Step 5: Verify the restored data
+info "Verifying the restored data..."
+kubectl apply -n "$NAMESPACE" -f - <<EOF
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: juicefs-verify-restore
+spec:
+  template:
+    spec:
+      containers:
+        - name: reader
+          image: busybox
+          command: ["/bin/sh", "-c"]
+          args: ["cat $TEST_FILE"]
+          volumeMounts:
+            - mountPath: "/mnt/juicefs"
+              name: juicefs-vol
+      volumes:
+        - name: juicefs-vol
+          persistentVolumeClaim:
+            claimName: $PVC_NAME
+      restartPolicy: Never
+EOF
+
+kubectl wait --for=condition=complete job/juicefs-verify-restore -n "$NAMESPACE"
+kubectl logs juicefs-verify-restore -n "$NAMESPACE"
+kubectl delete job juicefs-verify-restore -n "$NAMESPACE"
+
+info "✅ End-to-end test completed successfully."
+
+if [ "$NO_PREPARE" -eq 0 ]; then
+  echo "Preparing JuiceFS cluster in namespace $NAMESPACE with release $RELEASE..."
+  "$SCRIPT_DIR/prepare-jfs-cluster.sh" "$NAMESPACE" "$RELEASE"
+else
+  echo "Skipping JuiceFS cluster deletion."
+fi

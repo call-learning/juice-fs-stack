@@ -6,10 +6,6 @@ version: 0.1.0
 appVersion: "1.0"
 
 dependencies:
-  - name: redis
-    version: 18.1.3
-    repository: https://charts.bitnami.com/bitnami
-    condition: redis.enabled
   - name: juicefs-csi-driver
     version: 0.23.1
     repository: https://juicedata.github.io/charts/
